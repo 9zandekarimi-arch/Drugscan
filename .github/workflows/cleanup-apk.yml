@@ -130,6 +130,11 @@ jobs:
               deadline = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)
               cap = 512 * 1024 * 1024
               for c in caches:
+                  cache_key = str(c.get("key") or "").lower()
+                  # Preserve any persistent APK signing identity or certificate cache.
+                  if any(marker in cache_key for marker in ("signing", "keystore", "upload-key", "release-key", "certificate")):
+                      print("Preserving signing cache:", c.get("id"), flush=True)
+                      continue
                   ref = c.get("ref") or "unknown"
                   by_ref[ref] = by_ref.get(ref, 0) + 1
                   timestamp = c.get("last_accessed_at") or c.get("created_at")
