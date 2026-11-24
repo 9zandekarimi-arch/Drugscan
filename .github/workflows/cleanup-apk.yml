@@ -1,0 +1,157 @@
+name: Prune old Actions history
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/cleanup-apk.yml'
+  workflow_dispatch:
+    inputs:
+      aggressive_cache:
+        description: 'Clear all regenerable Actions caches'
+        required: false
+        type: boolean
+        default: true
+  schedule:
+    - cron: '17 2 * * *'
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: actions-retention-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Keep two successful APK builds per app; delete old runs and stale caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          AGGRESSIVE_CACHE: ${{ github.event_name == 'push' || inputs.aggressive_cache == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import datetime as dt
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+          
+          repo = os.environ["GH_REPO"]
+          current = int(os.environ["CURRENT_RUN_ID"])
+          aggressive = os.environ.get("AGGRESSIVE_CACHE", "false").lower() == "true"
+          base = "https://api.github.com/repos/" + repo
+          headers = {
+              "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "repo-actions-retention",
+          }
+          
+          def api(method, path):
+              last_error = None
+              for attempt in range(4):
+                  try:
+                      req = urllib.request.Request(base + path, headers=headers, method=method)
+                      with urllib.request.urlopen(req, timeout=25) as response:
+                          content = response.read()
+                          return json.loads(content) if content else {}
+                  except urllib.error.HTTPError as error:
+                      if method == "DELETE" and error.code == 404:
+                          return {}
+                      last_error = error
+                      if error.code not in (429, 500, 502, 503, 504) or attempt == 3:
+                          raise
+                  except Exception as error:
+                      last_error = error
+                      if attempt == 3:
+                          raise
+                  time.sleep(2 ** attempt)
+              raise last_error
+          
+          def list_all(path, key):
+              result = []
+              page = 1
+              while True:
+                  sep = "&" if "?" in path else "?"
+                  batch = api("GET", path + sep + "per_page=100&page=" + str(page)).get(key, [])
+                  result.extend(batch)
+                  if len(batch) < 100:
+                      break
+                  page += 1
+              return result
+          
+          runs = list_all("/actions/runs", "workflow_runs")
+          runs.sort(key=lambda r: (r.get("created_at", ""), r["id"]), reverse=True)
+          protect = {current}
+          latest_by_app = {}
+          for run in runs:
+              if run.get("status") != "completed":
+                  protect.add(run["id"])
+                  continue
+              name = run.get("name") or ""
+              if name.lower().startswith("build ") and "apk" in name.lower() and run.get("conclusion") == "success":
+                  kept = latest_by_app.setdefault(name, [])
+                  if len(kept) < 2:
+                      protect.add(run["id"])
+                      kept.append(run["id"])
+          # Never leave a repository with zero diagnostic history if no successful build exists.
+          if not latest_by_app:
+              protect.update(r["id"] for r in runs[:2])
+          targets = [r for r in reversed(runs) if r.get("status") == "completed" and r["id"] not in protect]
+          print("Repo:", repo, "total runs:", len(runs), "protected APK versions:", json.dumps(latest_by_app), flush=True)
+          print("Old completed runs to delete:", len(targets), flush=True)
+          deleted_runs = 0
+          failures = []
+          for run in targets:
+              try:
+                  api("DELETE", "/actions/runs/" + str(run["id"]))
+                  deleted_runs += 1
+              except Exception as exc:
+                  failures.append("run " + str(run["id"]) + ": " + str(exc))
+          print("Deleted runs:", deleted_runs, "failed:", len(failures), flush=True)
+          
+          try:
+              caches = list_all("/actions/caches", "actions_caches")
+              caches.sort(key=lambda x: x.get("last_accessed_at") or x.get("created_at") or "", reverse=True)
+              original_size = sum(int(x.get("size_in_bytes") or 0) for x in caches)
+              remaining = original_size
+              by_ref = {}
+              deleted_caches = 0
+              released_bytes = 0
+              deadline = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)
+              cap = 512 * 1024 * 1024
+              for c in caches:
+                  ref = c.get("ref") or "unknown"
+                  by_ref[ref] = by_ref.get(ref, 0) + 1
+                  timestamp = c.get("last_accessed_at") or c.get("created_at")
+                  age_old = bool(timestamp) and dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00")) < deadline
+                  delete = aggressive or age_old or by_ref[ref] > 1 or remaining > cap
+                  if not delete:
+                      continue
+                  try:
+                      api("DELETE", "/actions/caches/" + str(c["id"]))
+                      size = int(c.get("size_in_bytes") or 0)
+                      released_bytes += size
+                      remaining -= size
+                      deleted_caches += 1
+                  except Exception as exc:
+                      failures.append("cache " + str(c["id"]) + ": " + str(exc))
+              print("Caches:", len(caches), "deleted:", deleted_caches, "estimated freed MiB:", round(released_bytes/1048576, 1), flush=True)
+          except Exception as exc:
+              # Old run deletion must never fail merely because the cache API is restricted.
+              print("Cache API unavailable:", exc, flush=True)
+          if failures:
+              for f in failures[:25]:
+                  print("FAILED:", f, flush=True)
+              raise SystemExit("Partial cleanup; check API permissions or quota")
+          print("Cleanup successful. Running workflows and latest two successful APK builds per app are preserved.", flush=True)
+          PY
